@@ -63,6 +63,70 @@ def _log_activity(document, action):
         action=action,
     )
 
+def _delete_document_files(doc, *, include_originals: bool):
+    """
+    Delete files associated with a document.
+
+    include_originals=False  — soft-delete path: remove processing artifacts
+        (.debug_cache session images, training_images copies, tatr_crops, media/figures)
+        but keep pdf_file + thumbnail so the document can still be restored from Trash.
+
+    include_originals=True   — hard-delete path: everything above plus pdf_file + thumbnail.
+
+    Must be called BEFORE doc.delete() because the page rows are still needed to
+    collect session IDs and figure URLs.
+    """
+    import glob as _glob
+    import json as _json
+    import pathlib as _pl
+    import re as _re
+
+    _FIG_RE = _re.compile(r'/media/figures/[^"\'<>\s]+')
+
+    # Collect per-page artefacts from the DB before the CASCADE wipes them.
+    session_ids = list(doc.pages.values_list('session_id', flat=True))
+    figure_paths: set[_pl.Path] = set()
+    for page_vals in doc.pages.values('ocr_blocks', 'structured_content'):
+        for field_val in (page_vals['ocr_blocks'], page_vals['structured_content']):
+            if not field_val:
+                continue
+            raw = field_val if isinstance(field_val, str) else _json.dumps(field_val)
+            for url in _FIG_RE.findall(raw):
+                figure_paths.add(settings.MEDIA_ROOT / url.removeprefix('/media/'))
+
+    # Session images (.debug_cache + training_images) and TATR crops
+    for sid in session_ids:
+        if not sid:
+            continue
+        for path in (
+            settings.DEBUG_CACHE_DIR / f"{sid}.jpg",
+            settings.TRAINING_IMAGES_DIR / f"{sid}.jpg",
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        for crop in _glob.glob(str(settings.TATR_CROPS_DIR / f"{sid}_block_*.jpg")):
+            try:
+                _pl.Path(crop).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    # Figure crops (media/figures/)
+    for path in figure_paths:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # Original uploaded file + thumbnail — only on hard delete
+    if include_originals:
+        if doc.pdf_file:
+            doc.pdf_file.delete(save=False)
+        if doc.thumbnail:
+            doc.thumbnail.delete(save=False)
+
+
 def _doc_to_dict(doc, request):
     pages = list(doc.pages.all())
     return {
@@ -178,6 +242,17 @@ class OcrView(APIView):
         for lb_data in layout_blocks_data:
             try:
                 x1, y1, x2, y2 = lb_data["bbox"]
+                # Expand bbox slightly before cropping to recover content that
+                # sits right at the detection boundary (superscripts, descenders,
+                # border strokes). Skip for table: cell dividers are proportional
+                # to the original crop dimensions and expansion would misalign them.
+                if lb_data.get("label") != "table":
+                    bw, bh = x2 - x1, y2 - y1
+                    expand = max(4, int(min(bw, bh) * 0.02))
+                    x1 = max(0, x1 - expand)
+                    y1 = max(0, y1 - expand)
+                    x2 = min(img.width, x2 + expand)
+                    y2 = min(img.height, y2 + expand)
                 crop = img.crop((x1, y1, x2, y2))
                 lb = LayoutBlock(
                     label=lb_data["label"],
@@ -186,6 +261,7 @@ class OcrView(APIView):
                     column_idx=lb_data.get("column_idx", 0),
                     reading_order=lb_data.get("reading_order", 0),
                     confidence=lb_data.get("confidence", 1.0),
+                    table_structure=lb_data.get("table_structure"),
                 )
                 t0 = time.time()
                 blocks = process_region(lb)
@@ -254,6 +330,134 @@ class CropView(APIView):
             return HttpResponse(buf.getvalue(), content_type="image/png")
         except Exception as e:
             return Response({"error": f"Failed to crop image: {e}"}, status=500)
+
+
+class TableCellTypesView(APIView):
+    """
+    POST /api/debug/table-cell-types/
+
+    Crops each cell defined by table_structure row/col dividers, runs
+    DocLayout-YOLO on each crop, and returns a 2-D cell_types array using
+    the same vocab as Canvas Block OCR labels: plain_text / title /
+    isolate_formula / figure.  Defaults to plain_text when YOLO finds nothing.
+    """
+
+    _CELL_MIN_DIM = 128   # upscale to this before YOLO so small crops are legible
+
+    def post(self, request):
+        session_id      = request.data.get("session_id")
+        block_id        = request.data.get("block_id")
+        bbox            = request.data.get("bbox")
+        table_structure = request.data.get("table_structure")
+
+        if not session_id:
+            return Response({"error": "session_id required"}, status=400)
+        if not bbox or len(bbox) != 4:
+            return Response({"error": "bbox required (4 values)"}, status=400)
+        if not table_structure:
+            return Response({"error": "table_structure required"}, status=400)
+
+        session = _get_or_restore_session(session_id)
+        if not session:
+            return Response({"error": "session not found"}, status=404)
+
+        try:
+            img = Image.open(session["image_path"]).convert("RGB")
+        except Exception as e:
+            return Response({"error": f"Failed to load image: {e}"}, status=500)
+
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        table_crop = img.crop((x1, y1, x2, y2))
+
+        row_dividers = table_structure.get("row_dividers") or []
+        col_dividers = table_structure.get("col_dividers") or []
+        crop_w, crop_h = table_crop.size
+
+        row_boundaries = [0] + [round(d * crop_h) for d in row_dividers] + [crop_h]
+        col_boundaries = [0] + [round(d * crop_w) for d in col_dividers] + [crop_w]
+        n_rows = len(row_boundaries) - 1
+        n_cols = len(col_boundaries) - 1
+
+        if n_rows == 0 or n_cols == 0:
+            return Response({"error": "table_structure contains no rows or columns"}, status=400)
+
+        try:
+            from .ml.layout import ExamLayoutParser
+            parser = ExamLayoutParser()
+        except Exception as e:
+            return Response({"error": f"Failed to load layout parser: {e}"}, status=500)
+
+        cell_types = []
+        for r in range(n_rows):
+            row_types = []
+            for c in range(n_cols):
+                cell_crop = table_crop.crop((
+                    col_boundaries[c], row_boundaries[r],
+                    col_boundaries[c + 1], row_boundaries[r + 1],
+                )).convert("RGB")
+
+                cw, ch = cell_crop.size
+                if cw < self._CELL_MIN_DIM or ch < self._CELL_MIN_DIM:
+                    scale = max(self._CELL_MIN_DIM / max(cw, 1), self._CELL_MIN_DIM / max(ch, 1))
+                    cell_crop = cell_crop.resize(
+                        (max(1, round(cw * scale)), max(1, round(ch * scale))),
+                        Image.LANCZOS,
+                    )
+
+                try:
+                    blocks = parser.parse(cell_crop)
+                    if blocks:
+                        best = max(blocks, key=lambda b: b.confidence)
+                        row_types.append(best.label)
+                    else:
+                        row_types.append("plain_text")
+                except Exception:
+                    row_types.append("plain_text")
+
+            cell_types.append(row_types)
+
+        return Response({"cell_types": cell_types})
+
+
+class TableStructureView(APIView):
+
+    def post(self, request):
+        session_id = request.data.get("session_id")
+        block_id   = request.data.get("block_id")
+        bbox       = request.data.get("bbox")
+
+        if not session_id:
+            return Response({"error": "session_id required"}, status=400)
+        if not bbox or len(bbox) != 4:
+            return Response({"error": "bbox required (4 values: [x1, y1, x2, y2])"}, status=400)
+
+        session = _get_or_restore_session(session_id)
+        if not session:
+            return Response({"error": "session not found"}, status=404)
+
+        try:
+            img = Image.open(session["image_path"]).convert("RGB")
+        except Exception as e:
+            return Response({"error": f"Failed to load image: {e}"}, status=500)
+
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        crop = img.crop((x1, y1, x2, y2))
+
+        # Save crop to disk for COCO training data collection (Slice 05)
+        crops_dir = settings.TATR_CROPS_DIR
+        crop_filename = f"{session_id}_block_{block_id}.jpg"
+        try:
+            crop.save(crops_dir / crop_filename, "JPEG")
+        except Exception:
+            pass  # crop save failure is non-fatal
+
+        try:
+            from .ml.tatr import analyze_table_structure
+            table_structure = analyze_table_structure(crop)
+        except Exception as e:
+            return Response({"error": f"Table structure analysis failed: {e}"}, status=500)
+
+        return Response({"table_structure": table_structure})
 
 
 class SessionImageView(APIView):
@@ -487,14 +691,15 @@ class DocumentDetailView(APIView):
             return Response({'error': 'not found'}, status=404)
 
         if request.query_params.get('hard') == '1':
-            # Hard delete: remove files and record
-            if doc.pdf_file:
-                doc.pdf_file.delete(save=False)
-            if doc.thumbnail:
-                doc.thumbnail.delete(save=False)
+            # Hard delete: clean up processing artifacts + original files, then remove record.
+            _delete_document_files(doc, include_originals=True)
             doc.delete()
         else:
-            # Soft delete
+            # Soft delete: move to Trash.
+            # Processing artifacts (session images, figure crops, TATR crops) are cleaned
+            # up immediately — they are large and not needed to restore the document.
+            # The original uploaded file and thumbnail are kept so Restore still works.
+            _delete_document_files(doc, include_originals=False)
             doc.deleted_at = timezone.now()
             doc.save(update_fields=['deleted_at', 'updated_at'])
 
@@ -926,6 +1131,133 @@ class TrainingDataExportView(APIView):
         buf.seek(0)
         response = HttpResponse(buf.read(), content_type='application/zip')
         response['Content-Disposition'] = 'attachment; filename="layout_training_data.zip"'
+        return response
+
+
+class TatrTrainingDataView(APIView):
+    """
+    GET /api/tatr-training-data/
+
+    Export a ZIP of table crop images + COCO annotations for all table blocks
+    where table_structure.source == "edited" (user-corrected dividers).
+    These are ground-truth samples for TATR fine-tuning.
+    """
+
+    def get(self, request):
+        import json
+        from .models import DocumentPage
+
+        crops_dir = settings.TATR_CROPS_DIR
+        buf = io.BytesIO()
+        added = 0
+
+        coco_images = []
+        coco_annotations = []
+        image_id = 0
+        annotation_id = 0
+
+        qs = DocumentPage.objects.filter(document__deleted_at__isnull=True)
+
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for page in qs.iterator():
+                blocks = page.layout_blocks
+                if not blocks:
+                    continue
+
+                for block in blocks:
+                    if block.get('label') != 'table':
+                        continue
+                    ts = block.get('table_structure')
+                    if not ts or ts.get('source') != 'edited':
+                        continue
+
+                    block_id = block.get('id')
+                    crop_filename = f"{page.session_id}_block_{block_id}.jpg"
+                    crop_path = crops_dir / crop_filename
+                    if not crop_path.exists():
+                        continue
+
+                    try:
+                        with Image.open(crop_path) as im:
+                            crop_w, crop_h = im.size
+                    except Exception:
+                        continue
+
+                    image_id += 1
+                    coco_images.append({
+                        "id": image_id,
+                        "file_name": crop_filename,
+                        "width": crop_w,
+                        "height": crop_h,
+                    })
+
+                    row_dividers = ts.get('row_dividers', [])
+                    col_dividers = ts.get('col_dividers', [])
+                    header_rows  = ts.get('header_rows', 0)
+
+                    row_boundaries = [0] + [round(d * crop_h) for d in row_dividers] + [crop_h]
+                    col_boundaries = [0] + [round(d * crop_w) for d in col_dividers] + [crop_w]
+
+                    # Row annotations (header rows get category 1, body rows get 2)
+                    for i in range(len(row_boundaries) - 1):
+                        y1 = row_boundaries[i]
+                        y2 = row_boundaries[i + 1]
+                        annotation_id += 1
+                        coco_annotations.append({
+                            "id": annotation_id,
+                            "image_id": image_id,
+                            "category_id": 1 if i < header_rows else 2,
+                            "bbox": [0, y1, crop_w, y2 - y1],
+                            "area": crop_w * (y2 - y1),
+                            "iscrowd": 0,
+                        })
+
+                    # Column annotations
+                    for j in range(len(col_boundaries) - 1):
+                        x1 = col_boundaries[j]
+                        x2 = col_boundaries[j + 1]
+                        annotation_id += 1
+                        coco_annotations.append({
+                            "id": annotation_id,
+                            "image_id": image_id,
+                            "category_id": 3,
+                            "bbox": [x1, 0, x2 - x1, crop_h],
+                            "area": (x2 - x1) * crop_h,
+                            "iscrowd": 0,
+                        })
+
+                    # Whole-table annotation covering the entire crop
+                    annotation_id += 1
+                    coco_annotations.append({
+                        "id": annotation_id,
+                        "image_id": image_id,
+                        "category_id": 4,
+                        "bbox": [0, 0, crop_w, crop_h],
+                        "area": crop_w * crop_h,
+                        "iscrowd": 0,
+                    })
+
+                    zf.write(str(crop_path), f"images/{crop_filename}")
+                    added += 1
+
+            if added == 0:
+                return Response({'error': 'no edited table structures available'}, status=404)
+
+            coco = {
+                "categories": [
+                    {"id": 1, "name": "table column header"},
+                    {"id": 2, "name": "table row"},
+                    {"id": 3, "name": "table column"},
+                    {"id": 4, "name": "table"},
+                ],
+                "images": coco_images,
+                "annotations": coco_annotations,
+            }
+            zf.writestr("annotations.json", json.dumps(coco, indent=2))
+
+        buf.seek(0)
+        response = HttpResponse(buf.read(), content_type='application/zip')
+        response['Content-Disposition'] = 'attachment; filename="tatr_training_data.zip"'
         return response
 
 

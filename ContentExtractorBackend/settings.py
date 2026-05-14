@@ -80,6 +80,9 @@ DEBUG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 TRAINING_IMAGES_DIR = BASE_DIR / 'training_images'
 TRAINING_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
+TATR_CROPS_DIR = BASE_DIR / 'tatr_crops'
+TATR_CROPS_DIR.mkdir(parents=True, exist_ok=True)
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 REST_FRAMEWORK = {

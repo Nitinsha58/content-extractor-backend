@@ -33,6 +33,11 @@ class ExtractorConfig(AppConfig):
             init_models()
             print("✅ OCR models loaded")
 
+            print("🔄 Initializing TATR model...")
+            from .ml.tatr import init_tatr
+            init_tatr()
+            print("✅ TATR model loaded")
+
         except Exception as e:
             print(f"⚠️  Warning: Failed to preload ML models: {e}")
             print("   Server will continue but extraction will fail.")

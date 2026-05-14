@@ -10,6 +10,8 @@ urlpatterns = [
     path('api/debug/layout/', views.LayoutView.as_view(), name='layout'),
     path('api/debug/ocr/', views.OcrView.as_view(), name='ocr'),
     path('api/debug/crop/', views.CropView.as_view(), name='crop'),
+    path('api/debug/table-structure/', views.TableStructureView.as_view(), name='table_structure'),
+    path('api/debug/table-cell-types/', views.TableCellTypesView.as_view(), name='table_cell_types'),
     path('api/debug/session-image/<str:session_id>/', views.SessionImageView.as_view(), name='session_image'),
     path('api/export/', views.ExportView.as_view(), name='export'),
 
@@ -39,4 +41,5 @@ urlpatterns = [
 
     # ── Training data export ──────────────────────────────────────────────────
     path('api/training-data/export/', views.TrainingDataExportView.as_view(), name='training_export'),
+    path('api/tatr-training-data/', views.TatrTrainingDataView.as_view(), name='tatr_training_export'),
 ]

@@ -50,12 +50,13 @@ _SKIP_LABELS = {"abandon"}
 
 @dataclass
 class LayoutBlock:
-    label: str          # "title" | "plain_text" | "isolate_formula" | "table" | "figure"
-    bbox: List[int]     # [x1, y1, x2, y2] in pixels (absolute)
-    crop: Image.Image   # pre-extracted region
-    column_idx: int     # 0 = left / single column,  1 = right column
-    reading_order: int  # final sort index (0-based)
+    label: str                        # "title" | "plain_text" | "isolate_formula" | "table" | "figure"
+    bbox: List[int]                   # [x1, y1, x2, y2] in pixels (absolute)
+    crop: Image.Image                 # pre-extracted region
+    column_idx: int                   # 0 = left / single column,  1 = right column
+    reading_order: int                # final sort index (0-based)
     confidence: float
+    table_structure: Optional[dict] = None  # populated by TATR before OCR runs
 
 
 class ExamLayoutParser:

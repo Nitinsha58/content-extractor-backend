@@ -8,7 +8,8 @@ Routing table
 ─────────────
   plain_text / title  →  TextFormulaOCR  →  TextBlock + LatexBlock (inline/display)
   isolate_formula     →  LatexOCR        →  LatexBlock (display=True)
-  table               →  TableOCR        →  TableBlock  (falls back to text on error)
+  table               →  TextFormulaOCR + table_structure  →  TableBlock
+                         (error node if table_structure is absent — see ADR-0002)
   figure              →  ImageHandler    →  ImageBlock
   anything else       →  TextFormulaOCR  →  text fallback
 
@@ -21,7 +22,6 @@ Call init_models() once at app startup to pre-load all weights.
 from __future__ import annotations
 
 import os
-import re
 import sys
 from typing import List, Optional
 
@@ -47,7 +47,6 @@ from schema import Block, LatexBlock, TableBlock, TextBlock
 _text_formula_ocr = None   # TextFormulaOCR — plain_text (MFD + text OCR)
 _text_only_ocr    = None   # TextFormulaOCR with enable_formula=False — titles
 _p2t_model:        Optional[object] = None   # Pix2Text — for isolate_formula
-_table_ocr:        Optional[object] = None   # False = failed to load
 
 
 # ── Formula config matching FinalTest ────────────────────────────────────────
@@ -62,7 +61,6 @@ def init_models() -> None:
     _get_text_formula_ocr()
     _get_text_only_ocr()
     _get_p2t_model()
-    # TableOCR is lazy — don't block startup on it
 
 
 # ── Getters ───────────────────────────────────────────────────────────────────
@@ -81,6 +79,16 @@ def _get_text_formula_ocr():
             enable_formula=True,
             enable_spell_checker=False,
         )
+        # MFD default conf=0.25 causes false-positive formula detections on
+        # parenthetical notation like "(T)" in plain text, which masks that
+        # region before CnOCR runs and garbles the surrounding text.
+        # Raise to 0.45 to reduce false positives while still catching real
+        # inline/display formulas (which typically score >> 0.5).
+        if hasattr(_text_formula_ocr, 'mfd') and _text_formula_ocr.mfd is not None:
+            _orig_detect = _text_formula_ocr.mfd.detect
+            def _detect_high_conf(img_list, resized_shape=768, box_margin=0, conf=0.45, **kw):
+                return _orig_detect(img_list, resized_shape=resized_shape, box_margin=box_margin, conf=conf, **kw)
+            _text_formula_ocr.mfd.detect = _detect_high_conf
     return _text_formula_ocr
 
 
@@ -107,55 +115,11 @@ def _get_p2t_model():
     global _p2t_model
     if _p2t_model is None:
         from pix2text import Pix2Text
-        _p2t_model = Pix2Text.from_config(formula_config=_FORMULA_CFG)
+        _p2t_model = Pix2Text.from_config(
+            total_configs={"languages": ("en",)},
+            formula_config=_FORMULA_CFG,
+        )
     return _p2t_model
-
-
-def _get_table_ocr():
-    """
-    Returns the Pix2Text table_ocr instance with tuned structure detection thresholds.
-    Uses the main Pix2Text initialization which handles table extraction.
-
-    Threshold tuning:
-    - row/column detection: lowered to 0.3 (from 0.5) to detect more rows/columns
-    - This improves recall for tables with uncertain boundaries
-    """
-    global _table_ocr
-    if _table_ocr is None:
-        try:
-            from pix2text import Pix2Text, TableOCR
-            p2t = Pix2Text(enable_table=True)
-            _table_ocr = p2t.table_ocr
-
-            # If table_ocr is available, re-create with tuned thresholds
-            if _table_ocr is not None and hasattr(_table_ocr, 'text_ocr'):
-                try:
-                    structure_thresholds = {
-                        'table': 0.5,
-                        'table column': 0.3,            # lower: detect more columns
-                        'table row': 0.3,               # lower: detect more rows
-                        'table column header': 0.4,
-                        'table projected row header': 0.3,
-                        'table spanning cell': 0.5,
-                        'no object': 10,
-                    }
-                    _table_ocr = TableOCR(
-                        text_ocr=_table_ocr.text_ocr,
-                        spellchecker=getattr(_table_ocr, 'spellchecker', None),
-                        structure_thresholds=structure_thresholds,
-                        threshold_percentage=0.08,      # slightly lower for better row/col detection
-                    )
-                except Exception:
-                    # If re-creation fails, use the default table_ocr
-                    pass
-
-            # If table_ocr is still None, fall back to using Pix2Text directly
-            if _table_ocr is None:
-                _table_ocr = p2t
-        except Exception:
-            _table_ocr = False   # permanent failure sentinel
-
-    return _table_ocr if _table_ocr else None
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -168,14 +132,20 @@ def process_region(lb: LayoutBlock) -> List[Block]:
     label = lb.label
     crop  = lb.crop
 
+    if label == "table":
+        # Do NOT pad the outer table crop — row_dividers / col_dividers are
+        # fractions of the original crop dimensions; padding would shift all
+        # cell boundaries. Padding is applied per-cell in _ocr_cell_typed.
+        return _process_table(crop, lb.table_structure)
+
+    crop = _pad_crop(crop, label)
+
     if label == "plain_text":
         return _process_text(crop)
     elif label == "title":
         return _process_text(crop, formula=False)
     elif label == "isolate_formula":
         return _process_formula(crop)
-    elif label == "table":
-        return _process_table(crop)
     elif label == "figure":
         return [save_crop(crop, alt="figure")]
     else:
@@ -261,257 +231,208 @@ def _process_formula(crop: Image.Image) -> List[Block]:
     return [LatexBlock(value=text, display=True)]
 
 
-def _reconstruct_table_from_blocks(blocks: List[Block], img_size: tuple) -> Optional[TableBlock]:
+_CELL_PADDING = 4    # pixels of padding added around each cell crop
+_CELL_MIN_DIM = 32   # cells smaller than this get upscaled before OCR
+
+
+def _pad_crop(crop: Image.Image, label: str) -> Image.Image:
     """
-    Reconstruct table structure from text blocks using date pattern detection.
-    Groups blocks into rows based on detecting actual date patterns (MM/DD/YYYY).
+    Add white padding around a crop and optionally upscale it before OCR.
+
+    Padding rules (dynamic, based on the smaller crop dimension):
+      isolate_formula         → max(16, min_dim × 0.15)
+      plain_text / title      → max(12, min_dim × 0.08)
+      figure                  → max(1,  min_dim × 0.05)
+      everything else         → max(15, min_dim × 0.10)
+
+    If the padded height is still < 80 px the crop is upscaled 2×–3× so
+    OCR models have enough resolution to resolve superscripts, subscripts,
+    and small glyphs reliably.
     """
-    if not blocks or len(blocks) < 2:
-        return None
+    import cv2
+    import numpy as np
 
-    # Extract text blocks only
-    text_blocks = [b for b in blocks if isinstance(b, TextBlock)]
-    if len(text_blocks) < 2:
-        return None
+    w, h = crop.size
+    min_dim = min(w, h)
 
-    # Helper: detect if text is a date in MM/DD/YYYY format
-    def is_date_pattern(text: str) -> bool:
-        text = text.strip()
-        # Match MM/DD/YYYY, MM/DD/YY, M/D/YYYY, etc
-        date_patterns = [
-            r'^\d{1,2}/\d{1,2}/\d{2,4}$',  # MM/DD/YYYY
-            r'^\d{1,2}-\d{1,2}-\d{2,4}$',  # MM-DD-YYYY
-        ]
-        for pattern in date_patterns:
-            if re.match(pattern, text):
-                return True
-        return False
-
-    # Group blocks into rows by detecting date patterns
-    rows: List[List[TextBlock]] = []
-    current_row: List[TextBlock] = []
-
-    for block in text_blocks:
-        text = block.value.strip()
-        if is_date_pattern(text):
-            # Start a new row with this date
-            if current_row:
-                rows.append(current_row)
-            current_row = [block]
-        else:
-            # Add to current row
-            current_row.append(block)
-
-    # Don't forget the last row
-    if current_row:
-        rows.append(current_row)
-
-    if len(rows) < 2:
-        # Not enough rows to be a table
-        return None
-
-    # Determine the expected number of columns (most common row length)
-    row_lengths = [len(row) for row in rows]
-    from collections import Counter
-    col_count = Counter(row_lengths).most_common(1)[0][0] if row_lengths else 0
-    
-    if col_count < 2:
-        # Not enough columns
-        return None
-
-    # Normalize all rows to have the same column count
-    grid: List[List[List[Block]]] = []
-    for row in rows:
-        grid_row: List[List[Block]] = []
-        for block in row:
-            grid_row.append([block])
-        
-        # Pad with empty cells to match expected column count
-        while len(grid_row) < col_count:
-            grid_row.append([])
-        
-        # Truncate if too many columns
-        grid_row = grid_row[:col_count]
-        grid.append(grid_row)
-
-    return TableBlock(rows=len(grid), cols=col_count, cells=grid)
-
-
-def _process_table(crop: Image.Image) -> List[Block]:
-    """
-    Attempt to extract table structure using multiple strategies.
-    1. Try TableOCR with markdown output (fast path)
-    2. Try TableOCR with cell parsing (slower, more detailed)
-    Raises RuntimeError on all failure paths — caller records a structured error block.
-    """
-    table_ocr = _get_table_ocr()
-
-    if table_ocr is None or not hasattr(table_ocr, 'recognize'):
-        raise RuntimeError("Table OCR model unavailable")
-
-    try:
-        raw = table_ocr.recognize(crop, out_cells=True, out_markdown=True)
-    except Exception as e:
-        raise RuntimeError(f"Table OCR failed: {e}") from e
-
-    # Fast path: pre-rendered markdown
-    if raw.get('markdown') and len(raw['markdown']) > 0:
-        markdown_str = raw['markdown'][0].strip()
-        if markdown_str:
-            result = _markdown_to_table_block(markdown_str)
-            if result.rows > 0 and result.cols > 0:
-                return [result]
-
-    # Cell-parsing path
-    result = _build_table_block(raw)
-    if result.rows > 0 and result.cols > 0:
-        return [result]
-
-    raise RuntimeError("Table OCR returned empty structure")
-
-
-def _markdown_to_table_block(markdown_str: str) -> TableBlock:
-    """
-    Parse a markdown table string into a TableBlock.
-    Format:
-      | Header1 | Header2 |
-      |---------|---------|
-      | Data1   | Data2   |
-    """
-    lines = [line.strip() for line in markdown_str.split('\n') if line.strip()]
-    if len(lines) < 3:
-        return TableBlock(rows=0, cols=0, cells=[])
-
-    def parse_row(line: str) -> List[str]:
-        # Remove leading/trailing pipes and split by pipe
-        line = line.strip()
-        if line.startswith('|'):
-            line = line[1:]
-        if line.endswith('|'):
-            line = line[:-1]
-        cells = [cell.strip() for cell in line.split('|')]
-        return [c for c in cells if c]  # remove empty
-
-    try:
-        # Parse header row
-        header_row = parse_row(lines[0])
-        if not header_row:
-            return TableBlock(rows=0, cols=0, cells=[])
-
-        num_cols = len(header_row)
-
-        # Skip separator row (line[1])
-        # Parse data rows
-        grid: List[List[List[Block]]] = []
-        for line in lines[2:]:
-            if '---' in line:  # skip extra separator rows
-                continue
-            row = parse_row(line)
-            if not row:
-                continue
-            # Pad row to match column count
-            while len(row) < num_cols:
-                row.append('')
-            grid_row = [[TextBlock(value=cell)] if cell else [] for cell in row[:num_cols]]
-            grid.append(grid_row)
-
-        if grid:
-            # Prepend header row
-            header_blocks = [[TextBlock(value=cell)] for cell in header_row]
-            grid.insert(0, header_blocks)
-
-        return TableBlock(rows=len(grid), cols=num_cols, cells=grid)
-    except Exception:
-        return TableBlock(rows=0, cols=0, cells=[])
-
-
-def _build_table_block(result) -> TableBlock:
-    """
-    Convert TableOCR output into a TableBlock.
-
-    Supported formats:
-    ─────────────────
-    1. Pix2Text format (actual):  {"cells": [[{row_nums, column_nums, cell text}, …], ...]}
-       outer list = tables, inner list = cells for that table (flat, not 2-D grid)
-    2. Legacy format 1:           {"cells": [{row_idx, col_idx, text}, …]}
-    3. Legacy format 2:           [[cell_str, …], …] (2-D list)
-    """
-    if isinstance(result, dict):
-        cells_raw = result.get("cells", result.get("rows", []))
-    elif isinstance(result, list):
-        cells_raw = result
+    if label == "isolate_formula":
+        pad = max(16, int(min_dim * 0.15))
+    elif label in ("plain_text", "title"):
+        pad = max(12, int(min_dim * 0.08))
+    elif label == "figure":
+        pad = max(1, int(min_dim * 0.05))
     else:
-        return TableBlock(rows=0, cols=0, cells=[])
+        pad = max(15, int(min_dim * 0.10))
 
-    if not cells_raw:
-        return TableBlock(rows=0, cols=0, cells=[])
+    arr = np.array(crop.convert("RGB"), dtype=np.uint8)
+    arr = cv2.copyMakeBorder(
+        arr, pad, pad, pad, pad,
+        cv2.BORDER_CONSTANT,
+        value=(255, 255, 255),
+    )
 
-    # ── Format 3: Pix2Text format (List[List[dict]] with row_nums/column_nums) ──
-    if isinstance(cells_raw[0], (list, tuple)) and len(cells_raw[0]) > 0:
-        if isinstance(cells_raw[0][0], dict) and "row_nums" in cells_raw[0][0]:
-            # cells_raw[0] = flat list of cell dicts for the first (main) table
-            table_cells = cells_raw[0]
-            if not table_cells:
-                return TableBlock(rows=0, cols=0, cells=[])
+    padded_h = arr.shape[0]
+    if padded_h < 80:
+        # Scale to reach ~80 px, but keep factor in the 2×–3× range.
+        scale = min(3.0, max(2.0, 80.0 / padded_h))
+        new_w = max(1, round(arr.shape[1] * scale))
+        new_h = max(1, round(padded_h * scale))
+        arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
-            # Find grid dimensions
-            try:
-                max_row = max(c.get("row_nums", [0])[0] for c in table_cells) + 1
-                max_col = max(c.get("column_nums", [0])[0] for c in table_cells) + 1
-            except (ValueError, IndexError, TypeError):
-                return TableBlock(rows=0, cols=0, cells=[])
+    return Image.fromarray(arr)
 
-            # Create empty grid
-            grid: List[List[List]] = [[[] for _ in range(max_col)] for _ in range(max_row)]
 
-            # Populate grid with cell text
-            for cell in table_cells:
-                try:
-                    row_indices = cell.get("row_nums", [])
-                    col_indices = cell.get("column_nums", [])
-                    if not row_indices or not col_indices:
-                        continue
+def _process_table(
+    crop: Image.Image,
+    table_structure: Optional[dict],
+) -> List[Block]:
+    """
+    Stage 3 of the three-stage table pipeline (ADR-0002, ADR-0003).
 
-                    r = row_indices[0]
-                    c = col_indices[0]
-                    text = (cell.get("cell text") or "").strip()
+    Requires table_structure with finalized=True from a prior Finalize action
+    (POST /api/debug/table-cell-types/).  Each cell is routed to the right
+    pix2text handler based on its Cell Type (plain_text / title /
+    isolate_formula / figure).
 
-                    if 0 <= r < max_row and 0 <= c < max_col:
-                        if text:
-                            grid[r][c] = [TextBlock(value=text)]
-                        # Note: empty cells remain as []
-                except (TypeError, KeyError, IndexError):
-                    continue
+    Raises RuntimeError if table_structure is absent or not finalized.
+    """
+    if not table_structure:
+        raise RuntimeError(
+            "table_structure is required for table OCR. "
+            "Run Table Structure Analysis, then click Finalize."
+        )
 
-            return TableBlock(rows=max_row, cols=max_col, cells=grid)
+    if not table_structure.get("finalized", False):
+        raise RuntimeError(
+            "Table structure must be finalized before OCR can run. "
+            "Click 'Finalize' on the table block to lock the grid and detect cell types."
+        )
 
-    # ── Format 1: key-value with row_idx / col_idx ────────────────────────────
-    if isinstance(cells_raw[0], dict) and "row_idx" in cells_raw[0]:
-        max_row = max(c.get("row_idx", 0) for c in cells_raw) + 1
-        max_col = max(c.get("col_idx", 0) for c in cells_raw) + 1
-        grid: List[List[List]] = [[[] for _ in range(max_col)] for _ in range(max_row)]
-        for cell in cells_raw:
-            r    = cell.get("row_idx", 0)
-            c    = cell.get("col_idx", 0)
-            text = (cell.get("text") or cell.get("content") or "").strip()
-            if r < max_row and c < max_col and text:
-                grid[r][c] = [TextBlock(value=text)]
-        return TableBlock(rows=max_row, cols=max_col, cells=grid)
+    # Apply the same skew correction that was used during TATR analysis.
+    deskew_angle = table_structure.get("deskew_angle", 0.0)
+    if deskew_angle:
+        from .tatr import deskew_crop as _deskew_crop
+        crop, _ = _deskew_crop(crop, angle=deskew_angle)
 
-    # ── Format 2: 2-D list ────────────────────────────────────────────────────
-    if isinstance(cells_raw[0], (list, tuple)):
-        grid = []
-        max_col = 0
-        for row in cells_raw:
-            grid_row = []
-            for cell in row:
-                if isinstance(cell, dict):
-                    text = (cell.get("text") or "").strip()
-                else:
-                    text = str(cell).strip()
-                grid_row.append([TextBlock(value=text)] if text else [])
-            grid.append(grid_row)
-            max_col = max(max_col, len(grid_row))
-        return TableBlock(rows=len(grid), cols=max_col, cells=grid)
+    crop_w, crop_h = crop.size
+    row_dividers = table_structure.get("row_dividers", [])
+    col_dividers = table_structure.get("col_dividers", [])
 
-    return TableBlock(rows=0, cols=0, cells=[])
+    row_boundaries = [0] + [round(d * crop_h) for d in row_dividers] + [crop_h]
+    col_boundaries = [0] + [round(d * crop_w) for d in col_dividers] + [crop_w]
+
+    n_rows = len(row_boundaries) - 1
+    n_cols = len(col_boundaries) - 1
+
+    if n_rows == 0 or n_cols == 0:
+        raise RuntimeError("table_structure contains no rows or columns")
+
+    cell_types = table_structure.get("cell_types") or []
+    grid: List[List[List[Block]]] = [[[] for _ in range(n_cols)] for _ in range(n_rows)]
+
+    for r in range(n_rows):
+        for c in range(n_cols):
+            cell_crop = _crop_cell(crop, row_boundaries, col_boundaries, r, c)
+            if cell_crop is None:
+                continue
+            cell_type = (
+                cell_types[r][c]
+                if r < len(cell_types) and c < len(cell_types[r])
+                else "plain_text"
+            )
+            grid[r][c] = _ocr_cell_typed(cell_crop, cell_type)
+
+    return [TableBlock(rows=n_rows, cols=n_cols, cells=grid)]
+
+
+def _ocr_cell_typed(cell_crop: Image.Image, cell_type: str) -> List[Block]:
+    """Route a single cell crop to the right OCR handler by its Cell Type."""
+    cell_crop = _pad_crop(cell_crop, cell_type)
+    if cell_type == "title":
+        return _ocr_cell(_get_text_only_ocr(), cell_crop)
+    elif cell_type == "isolate_formula":
+        try:
+            return _process_formula(cell_crop)
+        except Exception:
+            return _ocr_cell(_get_text_formula_ocr(), cell_crop)
+    elif cell_type == "figure":
+        return [save_crop(cell_crop, alt="figure")]
+    else:  # plain_text or unrecognised default
+        return _ocr_cell(_get_text_formula_ocr(), cell_crop)
+
+
+def _crop_cell(
+    table_crop: Image.Image,
+    row_boundaries: list,
+    col_boundaries: list,
+    r: int,
+    c: int,
+) -> Optional[Image.Image]:
+    """Crop one cell with padding, clamped to the table image bounds."""
+    tw, th = table_crop.size
+    x1 = max(0, col_boundaries[c]     - _CELL_PADDING)
+    y1 = max(0, row_boundaries[r]     - _CELL_PADDING)
+    x2 = min(tw, col_boundaries[c + 1] + _CELL_PADDING)
+    y2 = min(th, row_boundaries[r + 1] + _CELL_PADDING)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    cell = table_crop.crop((x1, y1, x2, y2)).convert("RGB")
+    # Upscale very small cells so OCR has enough resolution to work with
+    cw, ch = cell.size
+    if cw < _CELL_MIN_DIM or ch < _CELL_MIN_DIM:
+        scale = max(_CELL_MIN_DIM / max(cw, 1), _CELL_MIN_DIM / max(ch, 1), 1.0)
+        cell = cell.resize((max(1, round(cw * scale)), max(1, round(ch * scale))), Image.LANCZOS)
+    return cell
+
+
+def _ocr_cell(ocr, cell_crop: Image.Image) -> List:
+    """Run TextFormulaOCR on a single cell crop and return a list of Blocks."""
+    try:
+        result = ocr.recognize(cell_crop, return_text=False)
+    except Exception:
+        return []
+
+    if isinstance(result, str):
+        text = result.strip()
+        return [TextBlock(value=text)] if text else []
+
+    blocks: List = []
+    # Sort elements top→bottom, left→right for natural reading order within the cell
+    elems = []
+    cw, ch = cell_crop.size
+    for elem in (result or []):
+        text = (elem.get("text") or "").strip()
+        if not text:
+            continue
+        top_y, left_x = _elem_top_left(elem.get("position"), cw, ch)
+        elems.append((top_y, left_x, elem))
+    elems.sort(key=lambda t: (t[0], t[1]))
+
+    for _, _, elem in elems:
+        elem_type = elem.get("type", "text")
+        text = (elem.get("text") or "").strip()
+        if not text:
+            continue
+        if elem_type == "text":
+            if blocks and blocks[-1].type == "text":
+                blocks[-1] = TextBlock(value=blocks[-1].value + " " + text)
+            else:
+                blocks.append(TextBlock(value=text))
+        elif elem_type in ("embedding", "isolated"):
+            blocks.append(LatexBlock(value=clean_latex(text), display=(elem_type == "isolated")))
+
+    return blocks
+
+
+# ── Table geometry helpers ────────────────────────────────────────────────────
+
+def _elem_top_left(position, default_w: int, default_h: int) -> tuple:
+    """Return (top_y, left_x) from a pix2text position polygon."""
+    try:
+        import numpy as _np
+        arr = _np.array(position).reshape(-1, 2)
+        return float(arr[:, 1].min()), float(arr[:, 0].min())
+    except Exception:
+        return default_h / 2.0, default_w / 2.0
+
+

@@ -15,3 +15,4 @@ db.sqlite3
 .debug_cache/
 media/
 training_images/
+tatr_crops/

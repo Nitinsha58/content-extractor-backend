@@ -42,7 +42,6 @@ numpy==2.4.4
 omegaconf==2.3.0
 onnx==1.21.0
 onnxruntime==1.25.1
-opencv-python==4.13.0.92
 opencv-python-headless==4.13.0.92
 optimum==2.1.0
 optimum-onnx==0.1.0

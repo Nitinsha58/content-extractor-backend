@@ -85,6 +85,9 @@ TATR_CROPS_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+BACKEND_PORT     = int(os.environ.get('BACKEND_PORT', 8001))
+BACKEND_BASE_URL = os.environ.get('BACKEND_BASE_URL', f'http://localhost:{BACKEND_PORT}')
+
 REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',

@@ -509,7 +509,7 @@ class ExportView(APIView):
 
             if fmt == "html":
                 from .ml.exporters.html_exporter import export_html
-                content = export_html(page_node, base_url="http://localhost:8001/")
+                content = export_html(page_node, base_url=f"{settings.BACKEND_BASE_URL}/")
                 return HttpResponse(content, content_type="text/html",
                     headers={"Content-Disposition": 'attachment; filename="document.html"'})
 

@@ -7,7 +7,6 @@ into a structured_content JSON document suitable for the editor panel.
 Node types produced:
   section   — from title blocks
   paragraph — from plain_text blocks (may merge consecutive ones)
-  question  — when a plain_text block starts with a question-number pattern
   table     — from table blocks
   image     — from figure blocks
 
@@ -17,18 +16,8 @@ originating ocr_blocks, enabling two-way sync between canvas and editor.
 
 from __future__ import annotations
 
-import re
 import uuid
 from typing import Any, Dict, List, Optional
-
-# ── Patterns (mirrors segmenter.py logic without the LayoutBlock dependency) ──
-_Q_START = re.compile(
-    r"^\s*[\(\[]?\s*Q?\.?\s*(\d+)\s*[.\)\]:\s]",
-    re.IGNORECASE,
-)
-_OPT_START = re.compile(
-    r"^\s*[\(\[]?\s*([A-Da-d])\s*[.\)\]]\s*",
-)
 
 
 def _extract_text(blocks: List[Dict]) -> str:
@@ -86,17 +75,12 @@ def parse(ocr_blocks: List[Dict]) -> Dict:
     sorted_blocks = sorted(ocr_blocks, key=lambda b: b.get("reading_order", 0))
     top_nodes: List[Dict] = []
     current_section: Optional[Dict] = None
-    current_question: Optional[Dict] = None
 
     def emit(node: Dict) -> None:
-        nonlocal current_question
         if current_section is not None:
             current_section["children"].append(node)
         else:
             top_nodes.append(node)
-        # A non-option, non-paragraph node ends the current question context
-        if node["type"] not in ("paragraph",):
-            current_question = None
 
     for ocr_block in sorted_blocks:
         label = ocr_block.get("label", "")
@@ -105,7 +89,6 @@ def parse(ocr_blocks: List[Dict]) -> Dict:
 
         # OCR failed for this block — emit a visible error node instead of dropping it
         if ocr_block.get("error") and not inner_blocks:
-            current_question = None
             emit({
                 "id": _make_id(),
                 "type": "error",
@@ -118,7 +101,6 @@ def parse(ocr_blocks: List[Dict]) -> Dict:
         # ── figure ────────────────────────────────────────────────────────────
         if label == "figure":
             img = next((b for b in inner_blocks if b.get("type") == "image"), None)
-            current_question = None
             emit({
                 "id": _make_id(),
                 "type": "image",
@@ -133,7 +115,6 @@ def parse(ocr_blocks: List[Dict]) -> Dict:
         # ── table ─────────────────────────────────────────────────────────────
         if label == "table":
             tbl = next((b for b in inner_blocks if b.get("type") == "table"), None)
-            current_question = None
             emit({
                 "id": _make_id(),
                 "type": "table",
@@ -157,7 +138,6 @@ def parse(ocr_blocks: List[Dict]) -> Dict:
 
         # ── title → section ───────────────────────────────────────────────────
         if label == "title":
-            current_question = None
             new_section: Dict = {
                 "id": _make_id(),
                 "type": "section",
@@ -169,40 +149,12 @@ def parse(ocr_blocks: List[Dict]) -> Dict:
             current_section = new_section
             continue
 
-        # ── plain_text ─────────────────────────────────────────────────────────
-        leading_text = _extract_text(inner_blocks)
-        inline = _inline_content(inner_blocks)
-
-        # Check for question-number start
-        q_match = _Q_START.match(leading_text)
-        if q_match:
-            current_question = {
-                "id": _make_id(),
-                "type": "question",
-                "source_block_ids": [block_id],
-                "number": int(q_match.group(1)),
-                "stem": inline,
-                "options": [],
-            }
-            emit(current_question)
-            continue
-
-        # Check for option continuation (A/B/C/D)
-        opt_match = _OPT_START.match(leading_text)
-        if opt_match and current_question is not None:
-            current_question["source_block_ids"].append(block_id)
-            current_question["options"].append({
-                "label": opt_match.group(1).upper(),
-                "content": inline,
-            })
-            continue
-
-        # Otherwise: plain paragraph
+        # ── plain_text → paragraph ─────────────────────────────────────────────
         emit({
             "id": _make_id(),
             "type": "paragraph",
             "source_block_ids": [block_id],
-            "content": inline,
+            "content": _inline_content(inner_blocks),
         })
 
     return {"version": 1, "nodes": top_nodes}

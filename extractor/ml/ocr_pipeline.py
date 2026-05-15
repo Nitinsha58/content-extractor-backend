@@ -34,6 +34,8 @@ try:
 except Exception:
     pass
 
+import re
+
 from PIL import Image
 
 # ── Import clean_latex from cleaner module — copied from FinalTest ────────────────
@@ -42,6 +44,23 @@ from cleaner import clean_latex  # noqa: E402
 from image_handler import save_crop
 from layout import LayoutBlock
 from schema import Block, LatexBlock, TableBlock, TextBlock
+
+# ── False-positive formula detector ──────────────────────────────────────────
+# pix2text MFD sometimes tags italic/roman word characters as inline formulas,
+# producing \mathrm{o f}\mathrm{f}... instead of plain text.  A LaTeX value
+# that consists *entirely* of \mathrm{letters/spaces} groups is always plain
+# text — real math expressions contain digits, operators, or other commands.
+_PURE_MATHRM_RE = re.compile(r'^(\s*\\mathrm\{[A-Za-z][A-Za-z\s]*\}\s*)+$')
+_MATHRM_CONTENT_RE = re.compile(r'\\mathrm\{([^}]+)\}')
+
+
+def _mathrm_to_plain_text(latex: str) -> Optional[str]:
+    """Return extracted plain text if latex is a pure-\\mathrm false-positive, else None."""
+    if _PURE_MATHRM_RE.match(latex):
+        parts = [m.group(1).strip() for m in _MATHRM_CONTENT_RE.finditer(latex)]
+        joined = ' '.join(p for p in parts if p)
+        return joined or None
+    return None
 
 # ── Model singletons (lazy-loaded) ───────────────────────────────────────────
 _text_formula_ocr = None   # TextFormulaOCR — plain_text (MFD + text OCR)
@@ -202,12 +221,12 @@ def _process_text(crop: Image.Image, formula: bool = True) -> List[Block]:
         if elem_type == "text":
             blocks.append(TextBlock(value=text))
         elif elem_type in ("embedding", "isolated"):
-            blocks.append(
-                LatexBlock(
-                    value=clean_latex(text),
-                    display=(elem_type == "isolated"),
-                )
-            )
+            cleaned = clean_latex(text)
+            plain = _mathrm_to_plain_text(cleaned) if elem_type == "embedding" else None
+            if plain is not None:
+                blocks.append(TextBlock(value=plain))
+            else:
+                blocks.append(LatexBlock(value=cleaned, display=(elem_type == "isolated")))
 
     # If formula mode returned only LaTeX blocks (no text), MFD likely
     # misidentified the entire region as a formula. Re-run with text-only OCR.

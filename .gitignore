@@ -16,3 +16,4 @@ db.sqlite3
 media/
 training_images/
 tatr_crops/
+extractor/LayoutAnalyser/weights.pt

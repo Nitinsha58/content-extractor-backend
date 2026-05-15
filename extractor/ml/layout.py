@@ -26,8 +26,12 @@ import numpy as np
 from PIL import Image
 
 # ── Weights path ──────────────────────────────────────────────────────────────
-_HERE        = Path(os.path.dirname(os.path.abspath(__file__)))
-_WEIGHTS_PT  = _HERE / ".." / "LayoutAnalyser" / "weights.pt"
+# Prefer pix2text's cached copy (downloaded automatically by download_models.py).
+# Fall back to the local LayoutAnalyser/ copy for machines that have it already.
+_HERE         = Path(os.path.dirname(os.path.abspath(__file__)))
+_P2T_WEIGHTS  = Path.home() / ".pix2text" / "1.1" / "layout-docyolo" / "doclayout_yolo_docstructbench_imgsz1024.pt"
+_LOCAL_WEIGHTS = _HERE / ".." / "LayoutAnalyser" / "weights.pt"
+_WEIGHTS_PT   = _P2T_WEIGHTS if _P2T_WEIGHTS.exists() else _LOCAL_WEIGHTS
 
 # ── DocLayout-YOLO class id → our label string ────────────────────────────────
 # Classes from DocLayout-YOLO-DocStructBench (10 classes):

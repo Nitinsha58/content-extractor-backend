@@ -51,6 +51,46 @@ _DOCLAYOUT_LABEL: dict[int, str] = {
 # Labels that contribute no useful content → skip entirely
 _SKIP_LABELS = {"abandon"}
 
+_CONTAINMENT_THRESHOLD = 0.80
+
+
+def _remove_contained_duplicates(raw: list[dict]) -> list[dict]:
+    """Drop same-label blocks that are over-extended containers of a smaller block.
+
+    For every pair (A, B) with the same label: if more than 80% of B's area falls
+    inside A, A is the bloated duplicate — mark it for removal and keep B.
+    Handles chains (A contains B contains C) correctly because we scan all pairs.
+    """
+    n = len(raw)
+    to_remove: set[int] = set()
+    for i in range(n):
+        if i in to_remove:
+            continue
+        ax1, ay1, ax2, ay2 = raw[i]["bbox"]
+        area_a = (ax2 - ax1) * (ay2 - ay1)
+        if area_a <= 0:
+            continue
+        for j in range(n):
+            if i == j or j in to_remove:
+                continue
+            if raw[i]["label"] != raw[j]["label"]:
+                continue
+            bx1, by1, bx2, by2 = raw[j]["bbox"]
+            area_b = (bx2 - bx1) * (by2 - by1)
+            if area_b <= 0:
+                continue
+            # Intersection
+            ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
+            ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
+            containment_of_b_in_a = ((ix2 - ix1) * (iy2 - iy1)) / area_b
+            if containment_of_b_in_a > _CONTAINMENT_THRESHOLD:
+                # B is mostly inside A → A is the over-extended container → drop A
+                to_remove.add(i)
+                break
+    return [b for idx, b in enumerate(raw) if idx not in to_remove]
+
 
 @dataclass
 class LayoutBlock:
@@ -127,6 +167,12 @@ class ExamLayoutParser:
 
         if not raw:
             return []
+
+        # ── Containment deduplication ─────────────────────────────────────────
+        # Remove same-label blocks that are over-extended containers of a smaller,
+        # more accurate detection. If >80% of block B's area falls inside block A
+        # and both share the same label, A is the bloated duplicate — drop it.
+        raw = _remove_contained_duplicates(raw)
 
         # ── Two-column split ──────────────────────────────────────────────────
         col_boundary = self._detect_column_boundary(raw, img_w)

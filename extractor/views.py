@@ -49,6 +49,30 @@ def _get_or_restore_session(session_id: str) -> dict | None:
 
 _IMAGE_EXTS = {'jpg', 'jpeg', 'png', 'tiff', 'tif', 'bmp', 'webp', 'gif'}
 
+def _apply_erase_regions(crop: Image.Image, erase_regions: list, orig_bbox: list, crop_x1: int, crop_y1: int) -> None:
+    """White-out erase regions on a crop in-place before OCR.
+
+    erase_regions: list of [x1_frac, y1_frac, x2_frac, y2_frac] relative to orig_bbox.
+    crop_x1/y1: the top-left corner of the crop in page coordinates (may differ from
+    orig_bbox x1/y1 when bbox expansion was applied).
+    """
+    if not erase_regions:
+        return
+    from PIL import ImageDraw
+    ox1, oy1, ox2, oy2 = orig_bbox
+    orig_bw = ox2 - ox1
+    orig_bh = oy2 - oy1
+    draw = ImageDraw.Draw(crop)
+    for region in erase_regions:
+        xf1, yf1, xf2, yf2 = region
+        # Convert fractions to page-absolute coords, then to crop-local coords
+        px1 = int(ox1 + xf1 * orig_bw) - crop_x1
+        py1 = int(oy1 + yf1 * orig_bh) - crop_y1
+        px2 = int(ox1 + xf2 * orig_bw) - crop_x1
+        py2 = int(oy1 + yf2 * orig_bh) - crop_y1
+        draw.rectangle([px1, py1, px2, py2], fill=(255, 255, 255))
+    del draw
+
 def _get_file_type(filename):
     ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
     if ext == 'pdf':
@@ -216,6 +240,87 @@ class LayoutView(APIView):
         })
 
 
+class OcrStreamView(APIView):
+    """
+    POST /api/debug/ocr/stream/
+
+    Same inputs as OcrView but streams one NDJSON line per block as each
+    finishes OCR, instead of waiting for all blocks to complete.
+    """
+
+    def post(self, request):
+        import json as _json
+        from django.http import StreamingHttpResponse
+
+        session_id = request.data.get("session_id")
+        layout_blocks_data = request.data.get("layout_blocks", [])
+
+        if not session_id:
+            return Response({"error": "session_id required"}, status=400)
+
+        session = _get_or_restore_session(session_id)
+        if not session:
+            return Response({"error": "session not found"}, status=404)
+
+        try:
+            img = Image.open(session["image_path"]).convert("RGB")
+        except Exception as e:
+            return Response({"error": f"Failed to load cached image: {e}"}, status=500)
+
+        def generate():
+            from .ml.layout import LayoutBlock
+            from .ml.ocr_pipeline import process_region
+
+            for lb_data in layout_blocks_data:
+                try:
+                    x1, y1, x2, y2 = lb_data["bbox"]
+                    if lb_data.get("label") != "table":
+                        bw, bh = x2 - x1, y2 - y1
+                        expand = max(4, int(min(bw, bh) * 0.02))
+                        x1 = max(0, x1 - expand)
+                        y1 = max(0, y1 - expand)
+                        x2 = min(img.width, x2 + expand)
+                        y2 = min(img.height, y2 + expand)
+                    crop = img.crop((x1, y1, x2, y2))
+                    _apply_erase_regions(crop, lb_data.get("erase_regions", []), lb_data["bbox"], x1, y1)
+                    lb = LayoutBlock(
+                        label=lb_data["label"],
+                        bbox=lb_data["bbox"],
+                        crop=crop,
+                        column_idx=lb_data.get("column_idx", 0),
+                        reading_order=lb_data.get("reading_order", 0),
+                        confidence=lb_data.get("confidence", 1.0),
+                        table_structure=lb_data.get("table_structure"),
+                    )
+                    t0 = time.time()
+                    blocks = process_region(lb)
+                    duration = (time.time() - t0) * 1000
+                    result = {
+                        "block_id": lb_data.get("id", str(uuid.uuid4())),
+                        "label": lb_data["label"],
+                        "bbox": lb_data["bbox"],
+                        "reading_order": lb_data.get("reading_order", 0),
+                        "column_idx": lb_data.get("column_idx", 0),
+                        "blocks": [b.model_dump() for b in blocks],
+                        "duration_ms": round(duration, 1),
+                    }
+                except Exception as e:
+                    print(f"OCR stream failed for block {lb_data.get('id', '?')}: {e}")
+                    result = {
+                        "block_id": lb_data.get("id", str(uuid.uuid4())),
+                        "label": lb_data.get("label", ""),
+                        "bbox": lb_data.get("bbox", []),
+                        "reading_order": lb_data.get("reading_order", 0),
+                        "column_idx": lb_data.get("column_idx", 0),
+                        "blocks": [],
+                        "duration_ms": 0,
+                        "error": str(e),
+                    }
+                yield _json.dumps(result) + "\n"
+
+        return StreamingHttpResponse(generate(), content_type="application/x-ndjson")
+
+
 class OcrView(APIView):
 
     def post(self, request):
@@ -256,6 +361,7 @@ class OcrView(APIView):
                     x2 = min(img.width, x2 + expand)
                     y2 = min(img.height, y2 + expand)
                 crop = img.crop((x1, y1, x2, y2))
+                _apply_erase_regions(crop, lb_data.get("erase_regions", []), lb_data["bbox"], x1, y1)
                 lb = LayoutBlock(
                     label=lb_data["label"],
                     bbox=lb_data["bbox"],
@@ -1337,6 +1443,57 @@ class TatrTrainingDataView(APIView):
 
 # ── Structured content ────────────────────────────────────────────────────────
 
+def _repair_table_source_block_ids(structured_content, ocr_blocks):
+    """
+    Back-fill source_block_ids for table nodes that have it empty.
+
+    Older editor versions (before TableWithMeta) stripped source_block_ids
+    from table nodes during the TipTap → structured round-trip.  This one-time
+    repair matches empty-id table nodes to unmatched table OCR blocks by
+    positional order (reading_order), which mirrors how structure_parser.py
+    originally assigned them.  Returns True if any nodes were repaired.
+    """
+    # Collect block IDs that are already properly assigned
+    used_ids: set = set()
+
+    def _collect(nodes):
+        for n in nodes:
+            used_ids.update(x for x in (n.get('source_block_ids') or []) if x)
+            _collect(n.get('children') or [])
+
+    _collect(structured_content.get('nodes') or [])
+
+    # Available table OCR blocks not yet referenced, in reading-order
+    table_block_ids = [
+        b['block_id']
+        for b in sorted(
+            (b for b in (ocr_blocks or [])
+             if b.get('label') == 'table'
+             and b.get('block_id')
+             and b['block_id'] not in used_ids),
+            key=lambda b: b.get('reading_order', 0),
+        )
+    ]
+
+    if not table_block_ids:
+        return False
+
+    idx = [0]
+    repaired = [False]
+
+    def _repair(nodes):
+        for n in nodes:
+            if n.get('type') == 'table' and not any(n.get('source_block_ids') or []):
+                if idx[0] < len(table_block_ids):
+                    n['source_block_ids'] = [table_block_ids[idx[0]]]
+                    idx[0] += 1
+                    repaired[0] = True
+            _repair(n.get('children') or [])
+
+    _repair(structured_content.get('nodes') or [])
+    return repaired[0]
+
+
 class PageStructureView(APIView):
 
     def post(self, request, doc_id, page_number):
@@ -1353,8 +1510,12 @@ class PageStructureView(APIView):
         except DocumentPage.DoesNotExist:
             return Response({'error': 'page not found'}, status=404)
 
-        # Idempotent: return existing structured content if already parsed
+        # Idempotent: return existing structured content if already parsed.
+        # Also run a one-time repair to back-fill source_block_ids for table
+        # nodes that were stripped by an older editor version.
         if page.structured_content is not None:
+            if page.ocr_blocks and _repair_table_source_block_ids(page.structured_content, page.ocr_blocks):
+                page.save(update_fields=['structured_content'])
             return Response({'structured_content': page.structured_content})
 
         if not page.ocr_blocks:

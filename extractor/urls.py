@@ -9,6 +9,7 @@ urlpatterns = [
     # ── ML processing ─────────────────────────────────────────────────────────
     path('api/debug/layout/', views.LayoutView.as_view(), name='layout'),
     path('api/debug/ocr/', views.OcrView.as_view(), name='ocr'),
+    path('api/debug/ocr/stream/', views.OcrStreamView.as_view(), name='ocr_stream'),
     path('api/debug/crop/', views.CropView.as_view(), name='crop'),
     path('api/debug/table-structure/', views.TableStructureView.as_view(), name='table_structure'),
     path('api/debug/table-cell-types/', views.TableCellTypesView.as_view(), name='table_cell_types'),

@@ -4,8 +4,10 @@ Django settings for ContentExtractorBackend project.
 
 from pathlib import Path
 import os
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / '.env')
 
 SECRET_KEY = 'django-insecure-content-extractor-dev-key-change-in-production'
 
@@ -87,6 +89,11 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 BACKEND_PORT     = int(os.environ.get('BACKEND_PORT', 8001))
 BACKEND_BASE_URL = os.environ.get('BACKEND_BASE_URL', f'http://localhost:{BACKEND_PORT}')
+
+AWS_ACCESS_KEY_ID     = os.environ.get('AWS_ACCESS_KEY_ID', '')
+AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY', '')
+AWS_S3_BUCKET_NAME    = os.environ.get('AWS_S3_BUCKET_NAME', '')
+AWS_S3_REGION         = os.environ.get('AWS_S3_REGION', 'us-east-1')
 
 REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': [

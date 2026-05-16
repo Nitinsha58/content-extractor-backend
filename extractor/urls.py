@@ -20,6 +20,7 @@ urlpatterns = [
     path('api/documents/<uuid:doc_id>/', views.DocumentDetailView.as_view(), name='document_detail'),
     path('api/documents/<uuid:doc_id>/pages/<int:page_number>/', views.PageSaveView.as_view(), name='page_save'),
     path('api/documents/<uuid:doc_id>/pages/<int:page_number>/structure/', views.PageStructureView.as_view(), name='page_structure'),
+    path('api/figures/upload-s3/', views.FigureS3UploadView.as_view(), name='figure_upload_s3'),
 
     # ── Document actions ──────────────────────────────────────────────────────
     path('api/documents/<uuid:doc_id>/star/', views.DocumentStarView.as_view(), name='document_star'),

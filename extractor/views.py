@@ -3,6 +3,8 @@ API views for the extractor app.
 """
 
 import io
+import json
+import re as _re
 import uuid
 import time
 import zipfile
@@ -706,6 +708,77 @@ class DocumentDetailView(APIView):
         return Response(status=204)
 
 
+_FIGURE_URL_RE = _re.compile(r'/media/figures/[^\s"\'<>]+')
+
+
+def _collect_figure_urls(ocr_blocks) -> set:
+    if not ocr_blocks:
+        return set()
+    return set(_FIGURE_URL_RE.findall(json.dumps(ocr_blocks)))
+
+
+def _cleanup_orphaned_figures(old_ocr_blocks, new_ocr_blocks):
+    """Delete local figure files that were in old OCR blocks but not in the new ones."""
+    old_urls = _collect_figure_urls(old_ocr_blocks)
+    new_urls = _collect_figure_urls(new_ocr_blocks)
+    for url in old_urls - new_urls:
+        local_path = settings.MEDIA_ROOT / url.removeprefix('/media/')
+        try:
+            local_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _patch_node_s3_url(content: dict, node_id: str, s3_url: str) -> bool:
+    """Walk structured_content nodes and set s3_url on the matching image node."""
+    patched = False
+
+    def walk(node_list):
+        nonlocal patched
+        for node in node_list:
+            if node.get('id') == node_id and node.get('type') == 'image':
+                node['s3_url'] = s3_url
+                patched = True
+            if 'children' in node:
+                walk(node['children'])
+
+    walk(content.get('nodes', []))
+    return patched
+
+
+class FigureS3UploadView(APIView):
+
+    def post(self, request):
+        from .models import Document, DocumentPage
+        from .s3_uploader import upload_to_s3
+
+        local_url = request.data.get('local_url')
+        if not local_url:
+            return Response({'error': 'local_url required'}, status=400)
+
+        try:
+            s3_url = upload_to_s3(local_url)
+        except FileNotFoundError as e:
+            return Response({'error': str(e)}, status=404)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+        # Persist s3_url onto the node in structured_content (best-effort)
+        doc_id  = request.data.get('doc_id')
+        page_no = request.data.get('page_no')
+        node_id = request.data.get('node_id')
+        if doc_id and page_no and node_id:
+            try:
+                doc  = Document.objects.get(id=doc_id)
+                page = DocumentPage.objects.get(document=doc, page_number=int(page_no))
+                if page.structured_content and _patch_node_s3_url(page.structured_content, node_id, s3_url):
+                    page.save(update_fields=['structured_content'])
+            except Exception:
+                pass
+
+        return Response({'s3_url': s3_url})
+
+
 class PageSaveView(APIView):
 
     def get(self, request, doc_id, page_number):
@@ -749,6 +822,7 @@ class PageSaveView(APIView):
 
         # Invalidate cached structured content whenever ocr_blocks are updated
         if 'ocr_blocks' in fields and 'structured_content' not in fields:
+            _cleanup_orphaned_figures(page.ocr_blocks, request.data.get('ocr_blocks', []))
             page.structured_content = None
             page.structure_status = 'none'
             fields += ['structured_content', 'structure_status']

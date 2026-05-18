@@ -29,6 +29,7 @@ def _get_or_restore_session(session_id: str) -> dict | None:
     """
     session = ml_state._debug_sessions.get(session_id)
     if session:
+        ml_state.touch_session(session_id)
         return session
 
     # Try to restore from disk
@@ -42,7 +43,7 @@ def _get_or_restore_session(session_id: str) -> dict | None:
             except Exception:
                 continue
             restored = {"image_path": candidate, "image_w": w, "image_h": h}
-            ml_state._debug_sessions[session_id] = restored
+            ml_state.register_session(session_id, restored)
             return restored
 
     return None
@@ -153,15 +154,47 @@ def _delete_document_files(doc, *, include_originals: bool):
             doc.thumbnail.delete(save=False)
 
 
+def _generate_blank_thumbnail(doc, placed_images):
+    """Composite placed_images into a thumbnail and save it on the document."""
+    import base64 as _b64
+    from django.core.files.base import ContentFile
+    A4_W, A4_H = 2480, 3508
+    canvas = Image.new('RGB', (A4_W, A4_H), 'white')
+    for item in placed_images:
+        data_url = item.get('dataUrl', '')
+        if ',' not in data_url:
+            continue
+        _, b64data = data_url.split(',', 1)
+        pil_img = Image.open(io.BytesIO(_b64.b64decode(b64data))).convert('RGBA')
+        x, y = int(item.get('x', 0)), int(item.get('y', 0))
+        w, h = int(item.get('width', pil_img.width)), int(item.get('height', pil_img.height))
+        pil_img = pil_img.resize((w, h), Image.LANCZOS)
+        canvas.paste(pil_img, (x, y), pil_img)
+    canvas.thumbnail((400, 600))
+    buf = io.BytesIO()
+    canvas.save(buf, 'JPEG', quality=85)
+    if doc.thumbnail:
+        doc.thumbnail.delete(save=False)
+    doc.thumbnail.save(f'{doc.id}_thumb.jpg', ContentFile(buf.getvalue()), save=True)
+
+
 def _doc_to_dict(doc, request):
     pages = list(doc.pages.all())
+    # Lazy backfill: blank docs that gained images after creation have no thumbnail yet
+    if doc.file_type == 'blank' and not doc.thumbnail:
+        page1 = next((p for p in pages if p.page_number == 1 and p.placed_images), None)
+        if page1:
+            try:
+                _generate_blank_thumbnail(doc, page1.placed_images)
+            except Exception:
+                pass
     return {
         'id': str(doc.id),
         'filename': doc.filename,
         'page_count': doc.page_count,
         'status': doc.status,
         'thumbnail_url': request.build_absolute_uri(doc.thumbnail.url) if doc.thumbnail else None,
-        'pdf_url': request.build_absolute_uri(doc.pdf_file.url),
+        'pdf_url': request.build_absolute_uri(doc.pdf_file.url) if doc.pdf_file else None,
         'created_at': doc.created_at.isoformat(),
         'updated_at': doc.updated_at.isoformat(),
         'is_starred': doc.is_starred,
@@ -200,17 +233,18 @@ class LayoutView(APIView):
         except Exception as e:
             return Response({"error": f"Failed to save image: {e}"}, status=500)
 
-        try:
-            training_path = settings.TRAINING_IMAGES_DIR / f"{session_id}.jpg"
-            img.save(training_path, "JPEG", quality=85)
-        except Exception:
-            pass  # non-fatal — detection can still proceed without a training image
+        if getattr(settings, "SAVE_TRAINING_IMAGES", True):
+            try:
+                training_path = settings.TRAINING_IMAGES_DIR / f"{session_id}.jpg"
+                img.save(training_path, "JPEG", quality=85)
+            except Exception:
+                pass  # non-fatal — detection can still proceed without a training image
 
-        ml_state._debug_sessions[session_id] = {
+        ml_state.register_session(session_id, {
             "image_path": cache_path,
             "image_w": img.width,
             "image_h": img.height,
-        }
+        })
 
         try:
             layout_parser = ml_state.get_layout_parser()
@@ -675,8 +709,43 @@ class DocumentListCreateView(APIView):
         return Response([_doc_to_dict(doc, request) for doc in qs])
 
     def post(self, request):
-        from .models import Document
+        from .models import Document, DocumentPage
         pdf_file = request.FILES.get('pdf')
+
+        # ── Blank document path (no file) ─────────────────────────────────────
+        if not pdf_file and request.data.get('file_type') == 'blank':
+            filename = request.data.get('filename') or 'Untitled'
+            folder = None
+            folder_id = request.data.get('folder_id')
+            if folder_id:
+                try:
+                    from .models import Folder
+                    folder = Folder.objects.get(id=folder_id)
+                except Exception:
+                    pass
+            doc = Document.objects.create(
+                filename=filename,
+                page_count=1,
+                status='uploaded',
+                file_size=0,
+                file_type='blank',
+                folder=folder,
+            )
+            DocumentPage.objects.create(document=doc, page_number=1, status='idle')
+            _log_activity(doc, 'uploaded')
+            return Response({
+                'id': str(doc.id),
+                'filename': doc.filename,
+                'page_count': doc.page_count,
+                'status': doc.status,
+                'thumbnail_url': None,
+                'pdf_url': None,
+                'created_at': doc.created_at.isoformat(),
+                'file_size': 0,
+                'file_type': 'blank',
+            }, status=201)
+
+        # ── Normal file upload path ───────────────────────────────────────────
         if not pdf_file:
             return Response({'error': 'pdf file required'}, status=400)
 
@@ -736,7 +805,7 @@ class DocumentListCreateView(APIView):
             'page_count': doc.page_count,
             'status': doc.status,
             'thumbnail_url': request.build_absolute_uri(doc.thumbnail.url) if doc.thumbnail else None,
-            'pdf_url': request.build_absolute_uri(doc.pdf_file.url),
+            'pdf_url': request.build_absolute_uri(doc.pdf_file.url) if doc.pdf_file else None,
             'created_at': doc.created_at.isoformat(),
             'file_size': doc.file_size,
             'file_type': doc.file_type,
@@ -760,16 +829,18 @@ class DocumentDetailView(APIView):
             'image_h': p.image_h,
             'layout_blocks': p.layout_blocks,
             'ocr_blocks': p.ocr_blocks,
+            'placed_images': p.placed_images,
             'status': p.status,
         } for p in doc.pages.all()]
 
         return Response({
             'id': str(doc.id),
             'filename': doc.filename,
+            'file_type': doc.file_type,
             'page_count': doc.page_count,
             'status': doc.status,
             'thumbnail_url': request.build_absolute_uri(doc.thumbnail.url) if doc.thumbnail else None,
-            'pdf_url': request.build_absolute_uri(doc.pdf_file.url),
+            'pdf_url': request.build_absolute_uri(doc.pdf_file.url) if doc.pdf_file else None,
             'created_at': doc.created_at.isoformat(),
             'is_starred': doc.is_starred,
             'folder_id': str(doc.folder_id) if doc.folder_id else None,
@@ -784,11 +855,17 @@ class DocumentDetailView(APIView):
         except Document.DoesNotExist:
             return Response({'error': 'not found'}, status=404)
 
+        fields_to_save = ['updated_at']
         if 'page_count' in request.data:
             doc.page_count = int(request.data['page_count'])
-            doc.save(update_fields=['page_count', 'updated_at'])
+            fields_to_save.append('page_count')
+        if 'filename' in request.data:
+            doc.filename = str(request.data['filename']).strip() or doc.filename
+            fields_to_save.append('filename')
+        if len(fields_to_save) > 1:
+            doc.save(update_fields=fields_to_save)
 
-        return Response({'id': str(doc.id), 'page_count': doc.page_count})
+        return Response({'id': str(doc.id), 'page_count': doc.page_count, 'filename': doc.filename})
 
     def delete(self, request, doc_id):
         from .models import Document
@@ -902,6 +979,7 @@ class PageSaveView(APIView):
                 'image_h': page.image_h,
                 'layout_blocks': page.layout_blocks or [],
                 'ocr_blocks': page.ocr_blocks or [],
+                'placed_images': page.placed_images or [],
                 'status': page.status,
             })
         except DocumentPage.DoesNotExist:
@@ -918,7 +996,7 @@ class PageSaveView(APIView):
 
         fields = []
         for field in ('session_id', 'image_w', 'image_h', 'layout_blocks', 'ocr_blocks',
-                      'status', 'structured_content', 'structure_status'):
+                      'placed_images', 'status', 'structured_content', 'structure_status'):
             if field in request.data:
                 val = request.data[field]
                 if field in ('image_w', 'image_h'):
@@ -951,7 +1029,59 @@ class PageSaveView(APIView):
         if not was_complete and doc.status == 'complete':
             _log_activity(doc, 'ocr_completed')
 
+        # Regenerate thumbnail for blank docs when page 1 placed_images change
+        if 'placed_images' in fields and page_number == 1 and doc.file_type == 'blank':
+            placed = page.placed_images or []
+            if placed:
+                try:
+                    _generate_blank_thumbnail(doc, placed)
+                except Exception as e:
+                    print(f'Blank doc thumbnail generation failed: {e}')
+
         return Response({'id': str(page.id), 'page_number': page.page_number, 'status': page.status})
+
+    def delete(self, request, doc_id, page_number):
+        from .models import Document, DocumentPage
+        try:
+            doc = Document.objects.get(id=doc_id)
+        except Document.DoesNotExist:
+            return Response({'error': 'document not found'}, status=404)
+        if doc.file_type != 'blank':
+            return Response({'error': 'only blank documents support page delete'}, status=400)
+        if doc.pages.count() <= 1:
+            return Response({'error': 'cannot delete the only page'}, status=400)
+        try:
+            page = DocumentPage.objects.get(document=doc, page_number=page_number)
+        except DocumentPage.DoesNotExist:
+            return Response({'error': 'page not found'}, status=404)
+        page.delete()
+        # Re-number subsequent pages to keep them contiguous
+        for i, p in enumerate(DocumentPage.objects.filter(document=doc).order_by('page_number'), 1):
+            if p.page_number != i:
+                p.page_number = i
+                p.save(update_fields=['page_number'])
+        doc.page_count = DocumentPage.objects.filter(document=doc).count()
+        doc.save(update_fields=['page_count', 'updated_at'])
+        return Response({'ok': True})
+
+
+class BlankPageAddView(APIView):
+    """POST /api/documents/<id>/pages/add/ — append a new page to a blank document."""
+
+    def post(self, request, doc_id):
+        from .models import Document, DocumentPage
+        try:
+            doc = Document.objects.get(id=doc_id)
+        except Document.DoesNotExist:
+            return Response({'error': 'document not found'}, status=404)
+        if doc.file_type != 'blank':
+            return Response({'error': 'only blank documents support add-page'}, status=400)
+        last = doc.pages.order_by('-page_number').first()
+        next_no = (last.page_number + 1) if last else 1
+        page = DocumentPage.objects.create(document=doc, page_number=next_no, status='idle')
+        doc.page_count = next_no
+        doc.save(update_fields=['page_count', 'updated_at'])
+        return Response({'id': str(page.id), 'page_number': page.page_number}, status=201)
 
 
 # ── Document actions ──────────────────────────────────────────────────────────

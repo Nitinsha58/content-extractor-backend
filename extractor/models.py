@@ -53,6 +53,7 @@ class DocumentPage(models.Model):
     image_h       = models.PositiveIntegerField(default=0)
     layout_blocks      = models.JSONField(default=list)
     ocr_blocks         = models.JSONField(default=list)
+    placed_images      = models.JSONField(default=list)  # Blank Document only
     status             = models.CharField(max_length=20, default='idle')
     structured_content = models.JSONField(null=True, blank=True)
     structure_status   = models.CharField(max_length=20, default='none')

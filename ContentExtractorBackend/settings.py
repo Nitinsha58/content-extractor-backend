@@ -82,6 +82,12 @@ DEBUG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 TRAINING_IMAGES_DIR = BASE_DIR / 'training_images'
 TRAINING_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
+# Set to False to skip saving a copy of each page image in training_images/.
+# Disabling this saves ~670 KB per processed page and is safe if you don't use
+# the /api/training-data/ export feature. The debug_cache copy is always saved
+# because it is required for OCR operations.
+SAVE_TRAINING_IMAGES = True
+
 TATR_CROPS_DIR = BASE_DIR / 'tatr_crops'
 TATR_CROPS_DIR.mkdir(parents=True, exist_ok=True)
 

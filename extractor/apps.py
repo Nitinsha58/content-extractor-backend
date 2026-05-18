@@ -19,6 +19,8 @@ class ExtractorConfig(AppConfig):
         if str(ml_dir) not in sys.path:
             sys.path.insert(0, str(ml_dir))
 
+        self._cleanup_stale_artifacts()
+
         try:
             from . import ml_state
             from .ml.layout import ExamLayoutParser
@@ -43,3 +45,30 @@ class ExtractorConfig(AppConfig):
             print("   Server will continue but extraction will fail.")
             import traceback
             traceback.print_exc()
+
+    def _cleanup_stale_artifacts(self):
+        """At startup, remove debug_cache files not referenced by any DocumentPage."""
+        from pathlib import Path
+        from django.conf import settings
+
+        try:
+            from .models import DocumentPage
+            live = set(
+                DocumentPage.objects.exclude(session_id__isnull=True)
+                .exclude(session_id="")
+                .values_list("session_id", flat=True)
+            )
+        except Exception:
+            return  # DB not ready yet (e.g. first migration)
+
+        freed = 0
+        for path in Path(settings.DEBUG_CACHE_DIR).glob("*.jpg"):
+            if path.stem not in live:
+                try:
+                    freed += path.stat().st_size
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        if freed:
+            print(f"🧹 Cleaned {freed // (1024*1024)} MB of stale debug cache files")
